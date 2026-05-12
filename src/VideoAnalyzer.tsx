@@ -21,23 +21,44 @@ const API_BASE_URL = "http://localhost:8080";
 // 백엔드 연결 후에는 false로 바꾸세요
 const DEMO_MODE = true;
 
+// 타입 정의
+type ChatMessage = {
+  role: "user" | "assistant";
+  content: string;
+  isError?: boolean;
+};
+
+type AnalysisResult = {
+  videoId: string;
+  duration: string;
+  analysis: {
+    objects: string[];
+    scenes: number;
+    confidence: number;
+    summary: string;
+  };
+  processedAt: string;
+};
+
+type Status = "idle" | "uploading" | "analyzing" | "done" | "error";
+
 export default function VideoAnalyzer() {
   // 영상 업로드 관련 상태
-  const [file, setFile] = useState(null);
-  const [preview, setPreview] = useState(null);
+  const [file, setFile] = useState<File | null>(null);
+  const [preview, setPreview] = useState<string | null>(null);
   const [isDragging, setIsDragging] = useState(false);
   const [uploadProgress, setUploadProgress] = useState(0);
-  const [status, setStatus] = useState("idle"); // idle | uploading | analyzing | done | error
-  const [result, setResult] = useState(null);
+  const [status, setStatus] = useState<Status>("idle");
+  const [result, setResult] = useState<AnalysisResult | null>(null);
   const [errorMsg, setErrorMsg] = useState("");
-  const fileInputRef = useRef(null);
+  const fileInputRef = useRef<HTMLInputElement | null>(null);
 
   // 챗봇 관련 상태
-  const [messages, setMessages] = useState([]);
+  const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [chatInput, setChatInput] = useState("");
   const [isChatLoading, setIsChatLoading] = useState(false);
-  const chatEndRef = useRef(null);
-  const chatInputRef = useRef(null);
+  const chatEndRef = useRef<HTMLDivElement | null>(null);
+  const chatInputRef = useRef<HTMLInputElement | null>(null);
 
   const MAX_SIZE = 500 * 1024 * 1024; // 500MB
 
@@ -60,7 +81,7 @@ export default function VideoAnalyzer() {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, isChatLoading]);
 
-  const formatBytes = (bytes) => {
+  const formatBytes = (bytes: number): string => {
     if (bytes === 0) return "0 B";
     const k = 1024;
     const sizes = ["B", "KB", "MB", "GB"];
@@ -68,7 +89,7 @@ export default function VideoAnalyzer() {
     return `${parseFloat((bytes / Math.pow(k, i)).toFixed(2))} ${sizes[i]}`;
   };
 
-  const validateFile = (file) => {
+  const validateFile = (file: File): string | null => {
     if (!file.type.startsWith("video/")) {
       return "영상 파일만 업로드할 수 있습니다.";
     }
@@ -78,7 +99,7 @@ export default function VideoAnalyzer() {
     return null;
   };
 
-  const handleFile = (selectedFile) => {
+  const handleFile = (selectedFile: File | undefined | null) => {
     if (!selectedFile) return;
     const error = validateFile(selectedFile);
     if (error) {
@@ -95,18 +116,18 @@ export default function VideoAnalyzer() {
     setMessages([]);
   };
 
-  const handleDrop = useCallback((e) => {
+  const handleDrop = useCallback((e: React.DragEvent<HTMLDivElement>) => {
     e.preventDefault();
     setIsDragging(false);
     handleFile(e.dataTransfer.files[0]);
   }, []);
 
-  const handleDragOver = useCallback((e) => {
+  const handleDragOver = useCallback((e: React.DragEvent<HTMLDivElement>) => {
     e.preventDefault();
     setIsDragging(true);
   }, []);
 
-  const handleDragLeave = useCallback((e) => {
+  const handleDragLeave = useCallback((e: React.DragEvent<HTMLDivElement>) => {
     e.preventDefault();
     setIsDragging(false);
   }, []);
@@ -125,11 +146,12 @@ export default function VideoAnalyzer() {
   };
 
   // === 실제 백엔드 호출 ===
-  const uploadToBackend = async () => {
+  const uploadToBackend = async (): Promise<AnalysisResult> => {
+    if (!file) throw new Error("파일이 없습니다.");
     const formData = new FormData();
     formData.append("video", file);
 
-    const uploadResult = await new Promise((resolve, reject) => {
+    const uploadResult = await new Promise<any>((resolve, reject) => {
       const xhr = new XMLHttpRequest();
       xhr.upload.addEventListener("progress", (e) => {
         if (e.lengthComputable) {
@@ -165,14 +187,14 @@ export default function VideoAnalyzer() {
   };
 
   // 챗봇 메시지 전송 (실제 백엔드)
-  const sendChatToBackend = async (userMessage) => {
+  const sendChatToBackend = async (userMessage: string): Promise<string> => {
     const res = await fetch(`${API_BASE_URL}/api/videos/chat`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         videoId: result?.videoId,
         message: userMessage,
-        history: messages, // 대화 맥락 함께 전달
+        history: messages,
       }),
     });
     if (!res.ok) throw new Error(`챗봇 응답 실패: ${res.status}`);
@@ -181,7 +203,7 @@ export default function VideoAnalyzer() {
   };
 
   // === 데모 모드 시뮬레이션 ===
-  const mockUploadAndAnalyze = async () => {
+  const mockUploadAndAnalyze = async (): Promise<AnalysisResult> => {
     for (let i = 0; i <= 100; i += 5) {
       await new Promise((r) => setTimeout(r, 80));
       setUploadProgress(i);
@@ -201,12 +223,13 @@ export default function VideoAnalyzer() {
     };
   };
 
-  const mockChatReply = async (userMessage) => {
+  const mockChatReply = async (userMessage: string): Promise<string> => {
     await new Promise((r) => setTimeout(r, 800 + Math.random() * 700));
     const lower = userMessage.toLowerCase();
+    if (!result) return "분석 결과가 없습니다.";
     if (lower.includes("객체") || lower.includes("뭐") || lower.includes("무엇")) {
       return `영상에서 감지된 주요 객체는 다음과 같습니다:\n\n${result.analysis.objects
-        .map((o, i) => `${i + 1}. ${o}`)
+        .map((o: string, i: number) => `${i + 1}. ${o}`)
         .join("\n")}\n\n신뢰도는 ${(result.analysis.confidence * 100).toFixed(0)}%입니다.`;
     }
     if (lower.includes("장면") || lower.includes("요약") || lower.includes("내용")) {
@@ -233,17 +256,18 @@ export default function VideoAnalyzer() {
       setStatus("done");
     } catch (err) {
       console.error(err);
-      setErrorMsg(err.message || "알 수 없는 오류가 발생했습니다.");
+      const message = err instanceof Error ? err.message : "알 수 없는 오류가 발생했습니다.";
+      setErrorMsg(message);
       setStatus("error");
     }
   };
 
-  const handleSendMessage = async (e) => {
+  const handleSendMessage = async (e?: React.FormEvent) => {
     e?.preventDefault();
     const trimmed = chatInput.trim();
     if (!trimmed || isChatLoading) return;
 
-    const userMsg = { role: "user", content: trimmed };
+    const userMsg: ChatMessage = { role: "user", content: trimmed };
     setMessages((prev) => [...prev, userMsg]);
     setChatInput("");
     setIsChatLoading(true);
@@ -326,99 +350,93 @@ export default function VideoAnalyzer() {
               type="file"
               accept="video/*"
               className="hidden"
-              onChange={(e) => handleFile(e.target.files[0])}
+              onChange={(e) => handleFile(e.target.files?.[0])}
             />
             <div className="flex flex-col items-center text-center">
-              <div className="w-16 h-16 rounded-2xl bg-zinc-800 flex items-center justify-center mb-6">
-                <Upload className="w-7 h-7 text-zinc-400" />
+              <div className="w-16 h-16 rounded-2xl bg-zinc-800 flex items-center justify-center mb-5">
+                <Upload className="w-7 h-7 text-zinc-400" strokeWidth={1.5} />
               </div>
-              <h2 className="text-xl font-semibold mb-2">영상을 끌어다 놓으세요</h2>
-              <p className="text-sm text-zinc-500 mb-6">또는 클릭해서 파일을 선택하세요</p>
-              <div className="flex items-center gap-2 text-xs text-zinc-600">
-                <span className="px-2 py-1 rounded bg-zinc-800/50">MP4</span>
-                <span className="px-2 py-1 rounded bg-zinc-800/50">MOV</span>
-                <span className="px-2 py-1 rounded bg-zinc-800/50">MKV</span>
-                <span className="px-2 py-1 rounded bg-zinc-800/50">WEBM</span>
-                <span className="ml-2">최대 500MB</span>
-              </div>
+              <h2 className="text-xl font-semibold mb-2">영상을 업로드하세요</h2>
+              <p className="text-sm text-zinc-500 mb-1">
+                파일을 드래그하거나 클릭하여 선택
+              </p>
+              <p className="text-xs text-zinc-600">
+                MP4, MOV, AVI · 최대 500MB
+              </p>
             </div>
           </div>
         )}
 
-        {/* 파일 선택 후 - 분석 진행 중 (왼쪽: 영상, 진행상황) */}
+        {/* 파일 선택 후 ~ 분석 중 */}
         {file && status !== "done" && (
-          <div className="space-y-6 max-w-3xl mx-auto">
-            <div className="bg-zinc-900/50 border border-zinc-800 rounded-2xl overflow-hidden">
-              <div className="aspect-video bg-black">
-                {preview && (
-                  <video src={preview} controls className="w-full h-full object-contain" />
-                )}
-              </div>
-              <div className="p-5 flex items-center justify-between">
-                <div className="flex items-center gap-3 min-w-0">
-                  <div className="w-10 h-10 rounded-lg bg-zinc-800 flex items-center justify-center shrink-0">
-                    <Film className="w-5 h-5 text-zinc-400" />
-                  </div>
-                  <div className="min-w-0">
-                    <p className="text-sm font-medium truncate">{file.name}</p>
-                    <p className="text-xs text-zinc-500">{formatBytes(file.size)}</p>
-                  </div>
+          <div className="max-w-3xl mx-auto">
+            {/* 파일 정보 카드 */}
+            <div className="bg-zinc-900/50 border border-zinc-800 rounded-2xl overflow-hidden mb-4">
+              {preview && status !== "error" && (
+                <div className="aspect-video bg-black relative">
+                  <video
+                    src={preview}
+                    controls
+                    className="w-full h-full object-contain"
+                  />
+                </div>
+              )}
+              <div className="p-5 flex items-center gap-4">
+                <div className="w-11 h-11 rounded-xl bg-zinc-800 flex items-center justify-center shrink-0">
+                  <Film className="w-5 h-5 text-zinc-400" />
+                </div>
+                <div className="flex-1 min-w-0">
+                  <p className="font-medium text-sm truncate">{file.name}</p>
+                  <p className="text-xs text-zinc-500 mt-0.5">{formatBytes(file.size)}</p>
                 </div>
                 {status === "idle" && (
-                  <button onClick={reset} className="p-2 hover:bg-zinc-800 rounded-lg transition-colors shrink-0">
-                    <X className="w-4 h-4 text-zinc-400" />
+                  <button
+                    onClick={reset}
+                    className="w-9 h-9 rounded-lg hover:bg-zinc-800 transition-colors flex items-center justify-center text-zinc-500 hover:text-zinc-300"
+                  >
+                    <X className="w-4 h-4" />
                   </button>
                 )}
               </div>
             </div>
 
             {status === "idle" && (
-              <div className="flex gap-3">
-                <button onClick={reset} className="flex-1 px-5 py-3 rounded-xl border border-zinc-800 hover:bg-zinc-900 transition-colors font-medium">
-                  취소
-                </button>
-                <button
-                  onClick={uploadAndAnalyze}
-                  className="flex-[2] px-5 py-3 rounded-xl bg-gradient-to-r from-emerald-400 to-cyan-500 text-zinc-950 font-semibold hover:opacity-90 transition-opacity flex items-center justify-center gap-2"
-                >
-                  <Play className="w-4 h-4" fill="currentColor" />
-                  AI 분석 시작
-                </button>
-              </div>
+              <button
+                onClick={uploadAndAnalyze}
+                className="w-full px-5 py-3.5 rounded-xl bg-gradient-to-r from-emerald-400 to-cyan-500 text-zinc-950 font-semibold hover:opacity-90 transition-opacity flex items-center justify-center gap-2"
+              >
+                <Play className="w-4 h-4" strokeWidth={2.5} />
+                분석 시작
+              </button>
             )}
 
             {status === "uploading" && (
-              <div className="bg-zinc-900/50 border border-zinc-800 rounded-xl p-5">
-                <div className="flex items-center justify-between mb-3">
-                  <div className="flex items-center gap-2">
-                    <Loader2 className="w-4 h-4 animate-spin text-emerald-400" />
-                    <span className="text-sm font-medium">업로드 중...</span>
+              <div className="space-y-3">
+                <div className="bg-zinc-900/50 border border-zinc-800 rounded-xl p-5">
+                  <div className="flex items-center justify-between mb-3">
+                    <div className="flex items-center gap-2.5">
+                      <Loader2 className="w-4 h-4 text-emerald-400 animate-spin" />
+                      <span className="text-sm font-medium">업로드 중</span>
+                    </div>
+                    <span className="text-sm font-mono text-zinc-400">{uploadProgress}%</span>
                   </div>
-                  <span className="text-sm font-mono text-zinc-400">{uploadProgress}%</span>
-                </div>
-                <div className="h-2 bg-zinc-800 rounded-full overflow-hidden">
-                  <div
-                    className="h-full bg-gradient-to-r from-emerald-400 to-cyan-500 transition-all duration-300"
-                    style={{ width: `${uploadProgress}%` }}
-                  />
+                  <div className="h-1.5 bg-zinc-800 rounded-full overflow-hidden">
+                    <div
+                      className="h-full bg-gradient-to-r from-emerald-400 to-cyan-500 transition-all duration-200"
+                      style={{ width: `${uploadProgress}%` }}
+                    />
+                  </div>
                 </div>
               </div>
             )}
 
             {status === "analyzing" && (
-              <div className="bg-zinc-900/50 border border-zinc-800 rounded-xl p-5">
-                <div className="flex items-center gap-3">
-                  <div className="w-10 h-10 rounded-lg bg-gradient-to-br from-emerald-400/20 to-cyan-500/20 flex items-center justify-center">
-                    <Sparkles className="w-5 h-5 text-emerald-400 animate-pulse" />
-                  </div>
-                  <div className="flex-1">
-                    <p className="text-sm font-medium">AI가 영상을 분석하고 있습니다</p>
-                    <p className="text-xs text-zinc-500 mt-0.5">잠시만 기다려 주세요</p>
-                  </div>
+              <div className="bg-zinc-900/50 border border-zinc-800 rounded-xl p-8 text-center">
+                <div className="inline-flex items-center justify-center w-12 h-12 rounded-full bg-emerald-400/10 mb-4">
+                  <Sparkles className="w-5 h-5 text-emerald-400 animate-pulse" />
                 </div>
-                <div className="mt-4 h-1 bg-zinc-800 rounded-full overflow-hidden">
-                  <div className="h-full bg-gradient-to-r from-emerald-400 to-cyan-500 animate-pulse w-full" />
-                </div>
+                <p className="text-sm font-medium mb-1">AI가 영상을 분석하고 있어요</p>
+                <p className="text-xs text-zinc-500">잠시만 기다려주세요...</p>
               </div>
             )}
 
@@ -440,7 +458,7 @@ export default function VideoAnalyzer() {
         )}
 
         {/* 분석 완료 - 2단 레이아웃 (왼쪽: 영상+결과, 오른쪽: 챗봇) */}
-        {status === "done" && result && (
+        {status === "done" && result && file && (
           <div className="grid grid-cols-1 lg:grid-cols-5 gap-6">
             {/* 왼쪽: 영상 + 분석 결과 */}
             <div className="lg:col-span-2 space-y-4">
@@ -482,7 +500,7 @@ export default function VideoAnalyzer() {
                   <div className="pt-2 border-t border-zinc-800">
                     <p className="text-xs text-zinc-500 mb-2">감지된 객체</p>
                     <div className="flex flex-wrap gap-1.5">
-                      {result.analysis.objects.map((obj) => (
+                      {result.analysis.objects.map((obj: string) => (
                         <span
                           key={obj}
                           className="text-xs px-2 py-1 rounded-md bg-zinc-800 text-zinc-300"
