@@ -14,14 +14,14 @@ import {
   RotateCcw,
 } from "lucide-react";
 
-// Spring 백엔드 엔드포인트 (배포 시 실제 URL로 교체)
-const API_BASE_URL = "http://localhost:8080";
+// Spring 백엔드 엔드포인트 (Vercel 환경변수로 주입)
+const API_BASE_URL =
+  import.meta.env.VITE_API_BASE_URL || "https://seongchan-spring.store";
 
-// 데모 모드: true면 실제 fetch 대신 모의 응답을 사용
-// 백엔드 연결 후에는 false로 바꾸세요
-const DEMO_MODE = true;
+// 분석 결과/챗봇은 아직 mock (AI 서버 연동 전)
+// 영상 업로드(S3 PUT)는 실제 동작
+const MOCK_ANALYSIS = true;
 
-// 타입 정의
 type ChatMessage = {
   role: "user" | "assistant";
   content: string;
@@ -31,6 +31,15 @@ type ChatMessage = {
 type AnalysisResult = {
   videoId: string;
   duration: string;
+  s3Key: string;
+  resolution?: string;
+  frames?: number;
+  points3D?: number;
+  spatialConfidence?: number;
+  spaceEstimate?: string;
+  spaceArea?: number;
+  preprocessTime?: string;
+  inferenceTime?: string;
   analysis: {
     objects: string[];
     scenes: number;
@@ -43,7 +52,6 @@ type AnalysisResult = {
 type Status = "idle" | "uploading" | "analyzing" | "done" | "error";
 
 export default function VideoAnalyzer() {
-  // 영상 업로드 관련 상태
   const [file, setFile] = useState<File | null>(null);
   const [preview, setPreview] = useState<string | null>(null);
   const [isDragging, setIsDragging] = useState(false);
@@ -53,7 +61,6 @@ export default function VideoAnalyzer() {
   const [errorMsg, setErrorMsg] = useState("");
   const fileInputRef = useRef<HTMLInputElement | null>(null);
 
-  // 챗봇 관련 상태
   const [messages, setMessages] = useState<ChatMessage[]>([]);
   const [chatInput, setChatInput] = useState("");
   const [isChatLoading, setIsChatLoading] = useState(false);
@@ -62,21 +69,20 @@ export default function VideoAnalyzer() {
 
   const MAX_SIZE = 500 * 1024 * 1024; // 500MB
 
-  // 분석 완료 시 챗봇 초기 메시지 추가
   useEffect(() => {
     if (status === "done" && result && messages.length === 0) {
       setMessages([
         {
           role: "assistant",
           content: `영상 분석이 완료되었습니다! 🎬\n\n${
-            result.analysis?.summary || "영상에서 다양한 요소가 감지되었습니다."
-          }\n\n영상에 대해 궁금한 점을 물어보세요. 예를 들어:\n• 영상에 어떤 객체들이 나타나나요?\n• 전체적인 분위기는 어떤가요?\n• 주요 장면을 요약해주세요`,
+            result.analysis?.summary ||
+            "AI 서버 연동 후 실제 분석 결과가 표시됩니다."
+          }\n\n영상에 대해 궁금한 점을 물어보세요.`,
         },
       ]);
     }
   }, [status, result]);
 
-  // 새 메시지 들어올 때마다 스크롤 맨 아래로
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, isChatLoading]);
@@ -89,11 +95,11 @@ export default function VideoAnalyzer() {
     return `${parseFloat((bytes / Math.pow(k, i)).toFixed(2))} ${sizes[i]}`;
   };
 
-  const validateFile = (file: File): string | null => {
-    if (!file.type.startsWith("video/")) {
+  const validateFile = (f: File): string | null => {
+    if (!f.type.startsWith("video/")) {
       return "영상 파일만 업로드할 수 있습니다.";
     }
-    if (file.size > MAX_SIZE) {
+    if (f.size > MAX_SIZE) {
       return `파일 크기는 ${formatBytes(MAX_SIZE)} 이하여야 합니다.`;
     }
     return null;
@@ -145,13 +151,22 @@ export default function VideoAnalyzer() {
     if (fileInputRef.current) fileInputRef.current.value = "";
   };
 
-  // === 실제 백엔드 호출 ===
-  const uploadToBackend = async (): Promise<AnalysisResult> => {
+  // === 백엔드 호출: Presigned URL 방식 ===
+  const uploadToS3ViaPresignedUrl = async (): Promise<AnalysisResult> => {
     if (!file) throw new Error("파일이 없습니다.");
-    const formData = new FormData();
-    formData.append("video", file);
 
-    const uploadResult = await new Promise<any>((resolve, reject) => {
+    const presignedRes = await fetch(
+      `${API_BASE_URL}/api/s3/presigned-url?fileName=${encodeURIComponent(
+        file.name
+      )}`,
+      { method: "GET" }
+    );
+    if (!presignedRes.ok) {
+      throw new Error(`presigned URL 요청 실패: ${presignedRes.status}`);
+    }
+    const { url: presignedUrl, fileName } = await presignedRes.json();
+
+    await new Promise<void>((resolve, reject) => {
       const xhr = new XMLHttpRequest();
       xhr.upload.addEventListener("progress", (e) => {
         if (e.lengthComputable) {
@@ -160,88 +175,56 @@ export default function VideoAnalyzer() {
       });
       xhr.addEventListener("load", () => {
         if (xhr.status >= 200 && xhr.status < 300) {
-          try {
-            resolve(JSON.parse(xhr.responseText));
-          } catch {
-            resolve({ raw: xhr.responseText });
-          }
+          resolve();
         } else {
-          reject(new Error(`업로드 실패: ${xhr.status}`));
+          reject(new Error(`S3 업로드 실패: ${xhr.status}`));
         }
       });
       xhr.addEventListener("error", () => reject(new Error("네트워크 오류")));
-      xhr.open("POST", `${API_BASE_URL}/api/videos/upload`);
-      xhr.send(formData);
+      xhr.open("PUT", presignedUrl);
+      xhr.setRequestHeader("Content-Type", file.type);
+      xhr.send(file);
     });
 
     setStatus("analyzing");
+
+    if (MOCK_ANALYSIS) {
+      await new Promise((r) => setTimeout(r, 2000));
+      // 분석 결과 필드는 비워둠 (AI 서버 연동 후 채워질 예정)
+      return {
+        videoId: "—",
+        duration: "—",
+        s3Key: fileName,
+        resolution: undefined,
+        frames: undefined,
+        points3D: undefined,
+        spatialConfidence: undefined,
+        spaceEstimate: undefined,
+        spaceArea: undefined,
+        preprocessTime: undefined,
+        inferenceTime: undefined,
+        analysis: {
+          objects: [],
+          scenes: 0,
+          confidence: 0,
+          summary: "",
+        },
+        processedAt: new Date().toISOString(),
+      };
+    }
 
     const analyzeRes = await fetch(`${API_BASE_URL}/api/videos/analyze`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ videoId: uploadResult.videoId || uploadResult.id }),
+      body: JSON.stringify({ s3Key: fileName }),
     });
-
     if (!analyzeRes.ok) throw new Error(`분석 실패: ${analyzeRes.status}`);
     return await analyzeRes.json();
   };
 
-  // 챗봇 메시지 전송 (실제 백엔드)
-  const sendChatToBackend = async (userMessage: string): Promise<string> => {
-    const res = await fetch(`${API_BASE_URL}/api/videos/chat`, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        videoId: result?.videoId,
-        message: userMessage,
-        history: messages,
-      }),
-    });
-    if (!res.ok) throw new Error(`챗봇 응답 실패: ${res.status}`);
-    const data = await res.json();
-    return data.reply || data.message || data.content;
-  };
-
-  // === 데모 모드 시뮬레이션 ===
-  const mockUploadAndAnalyze = async (): Promise<AnalysisResult> => {
-    for (let i = 0; i <= 100; i += 5) {
-      await new Promise((r) => setTimeout(r, 80));
-      setUploadProgress(i);
-    }
-    setStatus("analyzing");
-    await new Promise((r) => setTimeout(r, 2500));
-    return {
-      videoId: "vid_" + Math.random().toString(36).slice(2, 10),
-      duration: "00:01:24",
-      analysis: {
-        objects: ["person", "car", "building", "road", "tree"],
-        scenes: 4,
-        confidence: 0.92,
-        summary: "영상에서 도심 거리를 걸어가는 사람들과 차량이 감지되었습니다.",
-      },
-      processedAt: new Date().toISOString(),
-    };
-  };
-
   const mockChatReply = async (userMessage: string): Promise<string> => {
     await new Promise((r) => setTimeout(r, 800 + Math.random() * 700));
-    const lower = userMessage.toLowerCase();
-    if (!result) return "분석 결과가 없습니다.";
-    if (lower.includes("객체") || lower.includes("뭐") || lower.includes("무엇")) {
-      return `영상에서 감지된 주요 객체는 다음과 같습니다:\n\n${result.analysis.objects
-        .map((o: string, i: number) => `${i + 1}. ${o}`)
-        .join("\n")}\n\n신뢰도는 ${(result.analysis.confidence * 100).toFixed(0)}%입니다.`;
-    }
-    if (lower.includes("장면") || lower.includes("요약") || lower.includes("내용")) {
-      return `이 영상은 총 ${result.analysis.scenes}개의 장면으로 구성되어 있습니다.\n\n${result.analysis.summary}\n\n영상 길이: ${result.duration}`;
-    }
-    if (lower.includes("분위기") || lower.includes("느낌")) {
-      return "영상은 일상적인 도심 풍경을 담고 있으며, 차분하고 자연스러운 분위기입니다. 특별한 이벤트나 극적인 장면은 감지되지 않았습니다.";
-    }
-    if (lower.includes("안녕") || lower.includes("하이")) {
-      return "안녕하세요! 분석된 영상에 대해 무엇이든 물어보세요. 😊";
-    }
-    return `"${userMessage}"에 대한 답변을 드리자면, 분석 결과를 바탕으로 보았을 때 영상의 주요 내용은 ${result.analysis.summary}\n\n더 구체적으로 어떤 부분이 궁금하신가요?`;
+    return `"${userMessage}"에 대한 응답은 AI 서버 연동 후 실제 답변으로 대체됩니다.`;
   };
 
   const uploadAndAnalyze = async () => {
@@ -251,12 +234,13 @@ export default function VideoAnalyzer() {
     setErrorMsg("");
 
     try {
-      const data = DEMO_MODE ? await mockUploadAndAnalyze() : await uploadToBackend();
+      const data = await uploadToS3ViaPresignedUrl();
       setResult(data);
       setStatus("done");
     } catch (err) {
       console.error(err);
-      const message = err instanceof Error ? err.message : "알 수 없는 오류가 발생했습니다.";
+      const message =
+        err instanceof Error ? err.message : "알 수 없는 오류가 발생했습니다.";
       setErrorMsg(message);
       setStatus("error");
     }
@@ -267,15 +251,12 @@ export default function VideoAnalyzer() {
     const trimmed = chatInput.trim();
     if (!trimmed || isChatLoading) return;
 
-    const userMsg: ChatMessage = { role: "user", content: trimmed };
-    setMessages((prev) => [...prev, userMsg]);
+    setMessages((prev) => [...prev, { role: "user", content: trimmed }]);
     setChatInput("");
     setIsChatLoading(true);
 
     try {
-      const reply = DEMO_MODE
-        ? await mockChatReply(trimmed)
-        : await sendChatToBackend(trimmed);
+      const reply = await mockChatReply(trimmed);
       setMessages((prev) => [...prev, { role: "assistant", content: reply }]);
     } catch (err) {
       console.error(err);
@@ -294,13 +275,22 @@ export default function VideoAnalyzer() {
   };
 
   const suggestedQuestions = [
-    "영상에 어떤 객체들이 나타나나요?",
-    "영상 내용을 요약해주세요",
-    "전체적인 분위기는 어떤가요?",
+    "방 안에서 가장 큰 가구는?",
+    "창문은 몇 개 있나요?",
+    "조명의 위치는?",
   ];
 
+  // 빈 값일 때 placeholder("—") 보여주기 위한 헬퍼
+  const ph = (val: string | number | undefined | null) =>
+    val !== undefined && val !== null && val !== "" && val !== 0
+      ? String(val)
+      : "—";
+
   return (
-    <div className="min-h-screen bg-zinc-950 text-zinc-100" style={{ fontFamily: "system-ui, -apple-system, sans-serif" }}>
+    <div
+      className="min-h-screen bg-zinc-950 text-zinc-100"
+      style={{ fontFamily: "system-ui, -apple-system, sans-serif" }}
+    >
       {/* 헤더 */}
       <header className="border-b border-zinc-800 px-8 py-5 sticky top-0 bg-zinc-950/80 backdrop-blur-md z-10">
         <div className="max-w-6xl mx-auto flex items-center justify-between">
@@ -309,8 +299,12 @@ export default function VideoAnalyzer() {
               <Sparkles className="w-5 h-5 text-zinc-950" strokeWidth={2.5} />
             </div>
             <div>
-              <h1 className="text-lg font-bold tracking-tight">Video AI Analyzer</h1>
-              <p className="text-xs text-zinc-500">영상을 분석하고 AI와 대화하세요</p>
+              <h1 className="text-lg font-bold tracking-tight">
+                Video AI Analyzer
+              </h1>
+              <p className="text-xs text-zinc-500">
+                영상을 분석하고 AI와 대화하세요
+              </p>
             </div>
           </div>
           <div className="flex items-center gap-4">
@@ -370,7 +364,6 @@ export default function VideoAnalyzer() {
         {/* 파일 선택 후 ~ 분석 중 */}
         {file && status !== "done" && (
           <div className="max-w-3xl mx-auto">
-            {/* 파일 정보 카드 */}
             <div className="bg-zinc-900/50 border border-zinc-800 rounded-2xl overflow-hidden mb-4">
               {preview && status !== "error" && (
                 <div className="aspect-video bg-black relative">
@@ -387,7 +380,9 @@ export default function VideoAnalyzer() {
                 </div>
                 <div className="flex-1 min-w-0">
                   <p className="font-medium text-sm truncate">{file.name}</p>
-                  <p className="text-xs text-zinc-500 mt-0.5">{formatBytes(file.size)}</p>
+                  <p className="text-xs text-zinc-500 mt-0.5">
+                    {formatBytes(file.size)}
+                  </p>
                 </div>
                 {status === "idle" && (
                   <button
@@ -416,9 +411,13 @@ export default function VideoAnalyzer() {
                   <div className="flex items-center justify-between mb-3">
                     <div className="flex items-center gap-2.5">
                       <Loader2 className="w-4 h-4 text-emerald-400 animate-spin" />
-                      <span className="text-sm font-medium">업로드 중</span>
+                      <span className="text-sm font-medium">
+                        S3로 업로드 중
+                      </span>
                     </div>
-                    <span className="text-sm font-mono text-zinc-400">{uploadProgress}%</span>
+                    <span className="text-sm font-mono text-zinc-400">
+                      {uploadProgress}%
+                    </span>
                   </div>
                   <div className="h-1.5 bg-zinc-800 rounded-full overflow-hidden">
                     <div
@@ -435,7 +434,9 @@ export default function VideoAnalyzer() {
                 <div className="inline-flex items-center justify-center w-12 h-12 rounded-full bg-emerald-400/10 mb-4">
                   <Sparkles className="w-5 h-5 text-emerald-400 animate-pulse" />
                 </div>
-                <p className="text-sm font-medium mb-1">AI가 영상을 분석하고 있어요</p>
+                <p className="text-sm font-medium mb-1">
+                  AI가 영상을 분석하고 있어요
+                </p>
                 <p className="text-xs text-zinc-500">잠시만 기다려주세요...</p>
               </div>
             )}
@@ -445,11 +446,16 @@ export default function VideoAnalyzer() {
                 <div className="bg-red-500/5 border border-red-500/20 rounded-xl p-5 flex items-center gap-3">
                   <AlertCircle className="w-5 h-5 text-red-400 shrink-0" />
                   <div>
-                    <p className="text-sm font-medium text-red-300">오류 발생</p>
+                    <p className="text-sm font-medium text-red-300">
+                      오류 발생
+                    </p>
                     <p className="text-xs text-zinc-400 mt-0.5">{errorMsg}</p>
                   </div>
                 </div>
-                <button onClick={reset} className="w-full px-5 py-3 rounded-xl bg-zinc-800 hover:bg-zinc-700 transition-colors font-medium">
+                <button
+                  onClick={reset}
+                  className="w-full px-5 py-3 rounded-xl bg-zinc-800 hover:bg-zinc-700 transition-colors font-medium"
+                >
                   다시 시도
                 </button>
               </div>
@@ -457,27 +463,38 @@ export default function VideoAnalyzer() {
           </div>
         )}
 
-        {/* 분석 완료 - 2단 레이아웃 (왼쪽: 영상+결과, 오른쪽: 챗봇) */}
+        {/* 분석 완료 - HTML 프로토타입의 2단 레이아웃 그대로 */}
         {status === "done" && result && file && (
           <div className="grid grid-cols-1 lg:grid-cols-5 gap-6">
-            {/* 왼쪽: 영상 + 분석 결과 */}
+            {/* 왼쪽: 영상 + 분석 결과 + 처리 정보 */}
             <div className="lg:col-span-2 space-y-4">
+              {/* 영상 카드 */}
               <div className="bg-zinc-900/50 border border-zinc-800 rounded-2xl overflow-hidden">
                 <div className="aspect-video bg-black">
                   {preview && (
-                    <video src={preview} controls className="w-full h-full object-contain" />
+                    <video
+                      src={preview}
+                      controls
+                      className="w-full h-full object-contain"
+                    />
                   )}
                 </div>
                 <div className="p-4 border-t border-zinc-800">
                   <div className="flex items-center gap-2 mb-2">
                     <CheckCircle2 className="w-4 h-4 text-emerald-400" />
-                    <span className="text-xs font-medium text-emerald-300">분석 완료</span>
+                    <span className="text-xs font-medium text-emerald-300">
+                      분석 완료
+                    </span>
                   </div>
                   <p className="text-sm font-medium truncate">{file.name}</p>
-                  <p className="text-xs text-zinc-500">{formatBytes(file.size)}</p>
+                  <p className="text-xs text-zinc-500">
+                    {formatBytes(file.size)}
+                    {result.resolution ? ` · ${result.resolution}` : ""}
+                  </p>
                 </div>
               </div>
 
+              {/* 분석 결과 카드 */}
               <div className="bg-zinc-900/50 border border-zinc-800 rounded-xl p-4">
                 <h3 className="text-xs font-semibold text-zinc-400 mb-3 uppercase tracking-wider">
                   분석 결과
@@ -485,38 +502,93 @@ export default function VideoAnalyzer() {
                 <div className="space-y-2.5 text-sm">
                   <div className="flex justify-between">
                     <span className="text-zinc-500">길이</span>
-                    <span className="font-mono">{result.duration}</span>
+                    <span className="font-mono">{ph(result.duration)}</span>
                   </div>
                   <div className="flex justify-between">
-                    <span className="text-zinc-500">장면 수</span>
-                    <span className="font-mono">{result.analysis.scenes}</span>
+                    <span className="text-zinc-500">추출 프레임</span>
+                    <span className="font-mono">{ph(result.frames)}</span>
                   </div>
                   <div className="flex justify-between">
-                    <span className="text-zinc-500">신뢰도</span>
-                    <span className="font-mono text-emerald-400">
-                      {(result.analysis.confidence * 100).toFixed(0)}%
+                    <span className="text-zinc-500">3D 포인트 수</span>
+                    <span className="font-mono">
+                      {result.points3D
+                        ? result.points3D.toLocaleString()
+                        : "—"}
                     </span>
                   </div>
+                  <div className="flex justify-between">
+                    <span className="text-zinc-500">공간 추론 신뢰도</span>
+                    <span className="font-mono text-emerald-400">
+                      {result.spatialConfidence !== undefined
+                        ? `${(result.spatialConfidence * 100).toFixed(0)}%`
+                        : "—"}
+                    </span>
+                  </div>
+
                   <div className="pt-2 border-t border-zinc-800">
                     <p className="text-xs text-zinc-500 mb-2">감지된 객체</p>
-                    <div className="flex flex-wrap gap-1.5">
-                      {result.analysis.objects.map((obj: string) => (
-                        <span
-                          key={obj}
-                          className="text-xs px-2 py-1 rounded-md bg-zinc-800 text-zinc-300"
-                        >
-                          {obj}
-                        </span>
-                      ))}
+                    {result.analysis.objects.length > 0 ? (
+                      <div className="flex flex-wrap gap-1.5">
+                        {result.analysis.objects.map((obj: string) => (
+                          <span
+                            key={obj}
+                            className="text-xs px-2 py-1 rounded-md bg-zinc-800 text-zinc-300"
+                          >
+                            {obj}
+                          </span>
+                        ))}
+                      </div>
+                    ) : (
+                      <p className="text-xs text-zinc-600">—</p>
+                    )}
+                  </div>
+
+                  <div className="pt-2 border-t border-zinc-800">
+                    <p className="text-xs text-zinc-500 mb-2">공간 추정</p>
+                    <div className="flex items-center justify-between">
+                      <span className="text-zinc-300">
+                        {result.spaceEstimate
+                          ? `${result.spaceEstimate}${
+                              result.spaceArea
+                                ? ` (약 ${result.spaceArea}m²)`
+                                : ""
+                            }`
+                          : "—"}
+                      </span>
+                      <span className="text-xs px-2 py-0.5 rounded-full bg-emerald-400/10 text-emerald-300 border border-emerald-400/20">
+                        VLM-3R
+                      </span>
                     </div>
                   </div>
+                </div>
+              </div>
+
+              {/* 처리 정보 카드 */}
+              <div className="bg-zinc-900/30 border border-zinc-800 rounded-xl p-3">
+                <div className="flex justify-between text-xs">
+                  <span className="text-zinc-500">전처리 (CUT3R)</span>
+                  <span className="font-mono text-zinc-400">
+                    {ph(result.preprocessTime)}
+                  </span>
+                </div>
+                <div className="flex justify-between text-xs mt-1.5">
+                  <span className="text-zinc-500">VLM-3R 추론</span>
+                  <span className="font-mono text-zinc-400">
+                    {ph(result.inferenceTime)}
+                  </span>
+                </div>
+                <div className="flex justify-between text-xs mt-1.5">
+                  <span className="text-zinc-500">video_id</span>
+                  <span className="font-mono text-zinc-400">
+                    {ph(result.videoId)}
+                  </span>
                 </div>
               </div>
             </div>
 
             {/* 오른쪽: 챗봇 */}
             <div className="lg:col-span-3">
-              <div className="bg-zinc-900/50 border border-zinc-800 rounded-2xl flex flex-col h-[calc(100vh-220px)] min-h-[500px]">
+              <div className="bg-zinc-900/50 border border-zinc-800 rounded-2xl flex flex-col h-[calc(100vh-220px)] min-h-[600px]">
                 {/* 챗봇 헤더 */}
                 <div className="px-5 py-4 border-b border-zinc-800 flex items-center gap-3">
                   <div className="w-9 h-9 rounded-lg bg-gradient-to-br from-emerald-400 to-cyan-500 flex items-center justify-center">
@@ -524,8 +596,13 @@ export default function VideoAnalyzer() {
                   </div>
                   <div className="flex-1">
                     <p className="text-sm font-semibold">AI 어시스턴트</p>
-                    <p className="text-xs text-zinc-500">영상에 대해 무엇이든 물어보세요</p>
+                    <p className="text-xs text-zinc-500">
+                      영상에 대해 무엇이든 물어보세요
+                    </p>
                   </div>
+                  <span className="text-[10px] font-mono px-2 py-1 rounded-md bg-zinc-800 text-zinc-400 border border-zinc-700">
+                    VLM-3R · 7B
+                  </span>
                 </div>
 
                 {/* 메시지 영역 */}
@@ -533,7 +610,9 @@ export default function VideoAnalyzer() {
                   {messages.map((msg, idx) => (
                     <div
                       key={idx}
-                      className={`flex gap-3 ${msg.role === "user" ? "flex-row-reverse" : ""}`}
+                      className={`flex gap-3 ${
+                        msg.role === "user" ? "flex-row-reverse" : ""
+                      }`}
                     >
                       <div
                         className={`w-8 h-8 rounded-lg flex items-center justify-center shrink-0 ${
@@ -569,36 +648,43 @@ export default function VideoAnalyzer() {
                       </div>
                       <div className="bg-zinc-800 px-4 py-3 rounded-2xl rounded-tl-sm">
                         <div className="flex gap-1">
-                          <span className="w-1.5 h-1.5 bg-zinc-500 rounded-full animate-bounce" style={{ animationDelay: "0ms" }} />
-                          <span className="w-1.5 h-1.5 bg-zinc-500 rounded-full animate-bounce" style={{ animationDelay: "150ms" }} />
-                          <span className="w-1.5 h-1.5 bg-zinc-500 rounded-full animate-bounce" style={{ animationDelay: "300ms" }} />
+                          <span
+                            className="w-1.5 h-1.5 bg-zinc-500 rounded-full animate-bounce"
+                            style={{ animationDelay: "0ms" }}
+                          />
+                          <span
+                            className="w-1.5 h-1.5 bg-zinc-500 rounded-full animate-bounce"
+                            style={{ animationDelay: "150ms" }}
+                          />
+                          <span
+                            className="w-1.5 h-1.5 bg-zinc-500 rounded-full animate-bounce"
+                            style={{ animationDelay: "300ms" }}
+                          />
                         </div>
                       </div>
                     </div>
                   )}
 
-                  {/* 추천 질문 (첫 메시지 후에만 표시) */}
-                  {messages.length === 1 && !isChatLoading && (
-                    <div className="pt-2">
-                      <p className="text-xs text-zinc-500 mb-2 px-1">추천 질문</p>
-                      <div className="flex flex-wrap gap-2">
-                        {suggestedQuestions.map((q) => (
-                          <button
-                            key={q}
-                            onClick={() => {
-                              setChatInput(q);
-                              chatInputRef.current?.focus();
-                            }}
-                            className="text-xs px-3 py-1.5 rounded-full bg-zinc-800 hover:bg-zinc-700 transition-colors text-zinc-300 border border-zinc-700"
-                          >
-                            {q}
-                          </button>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-
                   <div ref={chatEndRef} />
+                </div>
+
+                {/* 추천 질문 */}
+                <div className="px-5 pb-2">
+                  <p className="text-xs text-zinc-500 mb-2 px-1">추천 질문</p>
+                  <div className="flex flex-wrap gap-2">
+                    {suggestedQuestions.map((q) => (
+                      <button
+                        key={q}
+                        onClick={() => {
+                          setChatInput(q);
+                          chatInputRef.current?.focus();
+                        }}
+                        className="text-xs px-3 py-1.5 rounded-full bg-zinc-800 hover:bg-zinc-700 transition-colors text-zinc-300 border border-zinc-700"
+                      >
+                        {q}
+                      </button>
+                    ))}
+                  </div>
                 </div>
 
                 {/* 입력 영역 */}
@@ -627,7 +713,6 @@ export default function VideoAnalyzer() {
           </div>
         )}
 
-        {/* 에러 (파일 선택 전) */}
         {!file && status === "error" && (
           <div className="mt-4 bg-red-500/5 border border-red-500/20 rounded-xl p-4 flex items-center gap-3 max-w-3xl mx-auto">
             <AlertCircle className="w-5 h-5 text-red-400 shrink-0" />
