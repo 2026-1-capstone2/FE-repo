@@ -1,4 +1,4 @@
-import VideoAnalyzer from './videoAnalyzer.tsx'
+import VideoAnalyzer from './VideoAnalyzer'
 
 function App() {
   return <VideoAnalyzer />
