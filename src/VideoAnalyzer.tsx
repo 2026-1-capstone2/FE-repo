@@ -18,9 +18,8 @@ import {
 const API_BASE_URL =
   import.meta.env.VITE_API_BASE_URL || "https://seongchan-spring.store";
 
-// 분석 결과/챗봇은 아직 mock (AI 서버 연동 전)
-// 영상 업로드(S3 PUT)는 실제 동작
-const MOCK_ANALYSIS = true;
+// 챗봇은 아직 mock (AI 서버 연동 전). 영상 분석은 SSE 실연동.
+const MOCK_CHAT = true;
 
 type ChatMessage = {
   role: "user" | "assistant";
@@ -49,6 +48,23 @@ type AnalysisResult = {
   processedAt: string;
 };
 
+// 백엔드 SSE가 보내는 analysis-result 페이로드 타입
+type BackendResult = {
+  jobId: string;
+  status: string; // "DONE" | "FAILED"
+  videoDurationSec?: number;
+  videoResolution?: string;
+  frameCount?: number;
+  points3D?: number;
+  spatialConfidence?: number;
+  estimatedType?: string;
+  estimatedAreaM2?: number;
+  detectedObjects?: string[];
+  preprocessMs?: number;
+  totalMs?: number;
+  errorMessage?: string;
+};
+
 type Status = "idle" | "uploading" | "analyzing" | "done" | "error";
 
 export default function VideoAnalyzer() {
@@ -67,6 +83,9 @@ export default function VideoAnalyzer() {
   const chatEndRef = useRef<HTMLDivElement | null>(null);
   const chatInputRef = useRef<HTMLInputElement | null>(null);
 
+  // SSE 연결 참조 (정리용)
+  const eventSourceRef = useRef<EventSource | null>(null);
+
   const MAX_SIZE = 500 * 1024 * 1024; // 500MB
 
   useEffect(() => {
@@ -76,7 +95,7 @@ export default function VideoAnalyzer() {
           role: "assistant",
           content: `영상 분석이 완료되었습니다! 🎬\n\n${
             result.analysis?.summary ||
-            "AI 서버 연동 후 실제 분석 결과가 표시됩니다."
+            "영상에 대해 궁금한 점을 물어보세요."
           }\n\n영상에 대해 궁금한 점을 물어보세요.`,
         },
       ]);
@@ -86,6 +105,15 @@ export default function VideoAnalyzer() {
   useEffect(() => {
     chatEndRef.current?.scrollIntoView({ behavior: "smooth" });
   }, [messages, isChatLoading]);
+
+  // 컴포넌트 unmount 시 SSE 연결 정리
+  useEffect(() => {
+    return () => {
+      if (eventSourceRef.current) {
+        eventSourceRef.current.close();
+      }
+    };
+  }, []);
 
   const formatBytes = (bytes: number): string => {
     if (bytes === 0) return "0 B";
@@ -140,6 +168,11 @@ export default function VideoAnalyzer() {
 
   const reset = () => {
     if (preview) URL.revokeObjectURL(preview);
+    // 진행 중인 SSE 연결 정리
+    if (eventSourceRef.current) {
+      eventSourceRef.current.close();
+      eventSourceRef.current = null;
+    }
     setFile(null);
     setPreview(null);
     setStatus("idle");
@@ -151,8 +184,43 @@ export default function VideoAnalyzer() {
     if (fileInputRef.current) fileInputRef.current.value = "";
   };
 
-  // === 백엔드 호출: Presigned URL 방식 ===
-  const uploadToS3ViaPresignedUrl = async (): Promise<AnalysisResult> => {
+  // 백엔드 SSE 결과(BackendResult) → 프론트 표시용(AnalysisResult) 매핑
+  const mapBackendResult = (
+    b: BackendResult,
+    s3Key: string
+  ): AnalysisResult => {
+    const objects = b.detectedObjects ?? [];
+    return {
+      videoId: b.jobId,
+      duration:
+        b.videoDurationSec !== undefined ? `${b.videoDurationSec}초` : "—",
+      s3Key,
+      resolution: b.videoResolution,
+      frames: b.frameCount,
+      points3D: b.points3D,
+      spatialConfidence: b.spatialConfidence,
+      spaceEstimate: b.estimatedType,
+      spaceArea: b.estimatedAreaM2,
+      preprocessTime:
+        b.preprocessMs !== undefined ? `${b.preprocessMs}ms` : undefined,
+      inferenceTime: b.totalMs !== undefined ? `${b.totalMs}ms` : undefined,
+      analysis: {
+        objects,
+        scenes: objects.length,
+        confidence: b.spatialConfidence ?? 0,
+        summary:
+          b.estimatedType
+            ? `${b.estimatedType} 공간으로 추정되며, ${objects.join(
+                ", "
+              )} 등의 객체가 감지되었습니다.`
+            : "분석이 완료되었습니다.",
+      },
+      processedAt: new Date().toISOString(),
+    };
+  };
+
+  // 1단계: S3 presigned URL 받아서 업로드 → s3Key 반환
+  const uploadToS3 = async (): Promise<string> => {
     if (!file) throw new Error("파일이 없습니다.");
 
     const presignedRes = await fetch(
@@ -186,47 +254,81 @@ export default function VideoAnalyzer() {
       xhr.send(file);
     });
 
-    setStatus("analyzing");
+    return fileName; // 백엔드가 돌려준 s3Key
+  };
 
-    if (MOCK_ANALYSIS) {
-      await new Promise((r) => setTimeout(r, 2000));
-      // 분석 결과 필드는 비워둠 (AI 서버 연동 후 채워질 예정)
-      return {
-        videoId: "—",
-        duration: "—",
-        s3Key: fileName,
-        resolution: undefined,
-        frames: undefined,
-        points3D: undefined,
-        spatialConfidence: undefined,
-        spaceEstimate: undefined,
-        spaceArea: undefined,
-        preprocessTime: undefined,
-        inferenceTime: undefined,
-        analysis: {
-          objects: [],
-          scenes: 0,
-          confidence: 0,
-          summary: "",
-        },
-        processedAt: new Date().toISOString(),
-      };
-    }
-
-    const analyzeRes = await fetch(`${API_BASE_URL}/api/videos/analyze`, {
+  // 2단계: 업로드 알림 → jobId 받기
+  const notifyUploaded = async (s3Key: string): Promise<string> => {
+    if (!file) throw new Error("파일이 없습니다.");
+    const res = await fetch(`${API_BASE_URL}/api/videos/uploaded`, {
       method: "POST",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ s3Key: fileName }),
+      body: JSON.stringify({
+        s3Key,
+        originalFilename: file.name,
+        fileSize: file.size,
+      }),
     });
-    if (!analyzeRes.ok) throw new Error(`분석 실패: ${analyzeRes.status}`);
-    return await analyzeRes.json();
+    if (!res.ok) throw new Error(`업로드 알림 실패: ${res.status}`);
+    const data = await res.json();
+    return data.jobId;
   };
 
-  const mockChatReply = async (userMessage: string): Promise<string> => {
-    await new Promise((r) => setTimeout(r, 800 + Math.random() * 700));
-    return `"${userMessage}"에 대한 응답은 AI 서버 연동 후 실제 답변으로 대체됩니다.`;
+  // 3단계: SSE 구독 → analysis-result 수신
+  const subscribeSse = (jobId: string, s3Key: string) => {
+    // 기존 연결 있으면 정리
+    if (eventSourceRef.current) {
+      eventSourceRef.current.close();
+    }
+
+    const es = new EventSource(
+      `${API_BASE_URL}/api/videos/${jobId}/stream`
+    );
+    eventSourceRef.current = es;
+
+    // 구독 성공 확인
+    es.addEventListener("connected", () => {
+      console.log("SSE 연결됨 - jobId:", jobId);
+    });
+
+    // 분석 결과 도착
+    es.addEventListener("analysis-result", (event) => {
+      try {
+        const backend: BackendResult = JSON.parse(
+          (event as MessageEvent).data
+        );
+
+        if (backend.status === "FAILED") {
+          setErrorMsg(backend.errorMessage || "분석에 실패했습니다.");
+          setStatus("error");
+        } else {
+          setResult(mapBackendResult(backend, s3Key));
+          setStatus("done");
+        }
+      } catch (err) {
+        console.error("결과 파싱 실패:", err);
+        setErrorMsg("결과를 처리하는 중 오류가 발생했습니다.");
+        setStatus("error");
+      } finally {
+        es.close();
+        eventSourceRef.current = null;
+      }
+    });
+
+    // 연결 에러 (타임아웃, 네트워크 등)
+    es.onerror = () => {
+      // SSE는 자동 재연결을 시도하므로, 이미 결과를 받았으면 무시
+      if (status === "done") return;
+      console.error("SSE 연결 오류");
+      es.close();
+      eventSourceRef.current = null;
+      // 결과를 아직 못 받았다면 에러 처리
+      setErrorMsg("서버 연결이 끊어졌습니다. 잠시 후 다시 시도해주세요.");
+      setStatus("error");
+    };
   };
 
+  // 전체 흐름: 업로드 → 알림 → SSE 구독
   const uploadAndAnalyze = async () => {
     if (!file) return;
     setStatus("uploading");
@@ -234,9 +336,15 @@ export default function VideoAnalyzer() {
     setErrorMsg("");
 
     try {
-      const data = await uploadToS3ViaPresignedUrl();
-      setResult(data);
-      setStatus("done");
+      // 1. S3 업로드
+      const s3Key = await uploadToS3();
+
+      // 2. 업로드 알림 → jobId
+      setStatus("analyzing");
+      const jobId = await notifyUploaded(s3Key);
+
+      // 3. SSE 구독하여 결과 대기 (결과는 콜백에서 setStatus("done"))
+      subscribeSse(jobId, s3Key);
     } catch (err) {
       console.error(err);
       const message =
@@ -244,6 +352,11 @@ export default function VideoAnalyzer() {
       setErrorMsg(message);
       setStatus("error");
     }
+  };
+
+  const mockChatReply = async (userMessage: string): Promise<string> => {
+    await new Promise((r) => setTimeout(r, 800 + Math.random() * 700));
+    return `"${userMessage}"에 대한 응답은 AI 서버 연동 후 실제 답변으로 대체됩니다.`;
   };
 
   const handleSendMessage = async (e?: React.FormEvent) => {
@@ -256,7 +369,10 @@ export default function VideoAnalyzer() {
     setIsChatLoading(true);
 
     try {
-      const reply = await mockChatReply(trimmed);
+      // 챗봇은 아직 mock (AI 서버 연동 후 실제 API로 교체)
+      const reply = MOCK_CHAT
+        ? await mockChatReply(trimmed)
+        : await mockChatReply(trimmed);
       setMessages((prev) => [...prev, { role: "assistant", content: reply }]);
     } catch (err) {
       console.error(err);
