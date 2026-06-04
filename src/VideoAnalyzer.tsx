@@ -18,8 +18,9 @@ import {
 const API_BASE_URL =
   import.meta.env.VITE_API_BASE_URL || "https://seongchan-spring.store";
 
-// 챗봇은 아직 mock (AI 서버 연동 전). 영상 분석은 SSE 실연동.
-const MOCK_CHAT = true;
+// 챗봇 mock 스위치: true면 가짜 응답, false면 실제 백엔드(/api/chat) 호출
+// AI 서버 꺼져있을 땐 true로 시연, 켜져있으면 false로 실연동
+const MOCK_CHAT = false;
 
 type ChatMessage = {
   role: "user" | "assistant";
@@ -63,6 +64,18 @@ type BackendResult = {
   preprocessMs?: number;
   totalMs?: number;
   errorMessage?: string;
+};
+
+// 백엔드 챗봇 응답 타입 (POST /api/chat)
+type ChatApiResponse = {
+  job_id: string;
+  answer: string;
+  metadata?: {
+    tokens_used?: number;
+    inference_time_ms?: number;
+    spatial_cache_hit?: boolean;
+    stub?: boolean;
+  };
 };
 
 type Status = "idle" | "uploading" | "analyzing" | "done" | "error";
@@ -213,7 +226,7 @@ export default function VideoAnalyzer() {
             ? `${b.estimatedType} 공간으로 추정되며, ${objects.join(
                 ", "
               )} 등의 객체가 감지되었습니다.`
-            : "분석이 완료되었습니다.",
+            : "분석이 완료되었습니다. 공간에 대해 궁금한 점을 질문해보세요.",
       },
       processedAt: new Date().toISOString(),
     };
@@ -254,7 +267,7 @@ export default function VideoAnalyzer() {
       xhr.send(file);
     });
 
-    return fileName; // 백엔드가 돌려준 s3Key
+    return fileName; // 백엔드가 돌려준 실제 S3 키 (UUID 포함)
   };
 
   // 2단계: 업로드 알림 → jobId 받기
@@ -354,9 +367,43 @@ export default function VideoAnalyzer() {
     }
   };
 
+  // 챗봇 mock 응답 (AI 서버 꺼져있을 때 시연용)
   const mockChatReply = async (userMessage: string): Promise<string> => {
     await new Promise((r) => setTimeout(r, 800 + Math.random() * 700));
     return `"${userMessage}"에 대한 응답은 AI 서버 연동 후 실제 답변으로 대체됩니다.`;
+  };
+
+  // 챗봇 실제 응답: 백엔드(/api/chat) → AI 서버(/api/v1/chat) 경유
+  const realChatReply = async (userMessage: string): Promise<string> => {
+    if (!result) throw new Error("분석 결과가 없습니다.");
+
+    // 지금까지의 대화를 AI 명세의 history 형식으로 변환
+    // (isError 메시지는 대화 맥락에서 제외)
+    const history = messages
+      .filter((m) => !m.isError)
+      .map((m) => ({
+        role: m.role,
+        content: m.content,
+      }));
+
+    const res = await fetch(`${API_BASE_URL}/api/chat`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        job_id: result.videoId, // SSE로 받은 jobId
+        user_id: "anonymous",
+        question: userMessage,
+        history,
+      }),
+    });
+    if (!res.ok) {
+      throw new Error(`챗봇 응답 실패: ${res.status}`);
+    }
+    const data: ChatApiResponse = await res.json();
+    if (!data.answer) {
+      throw new Error("AI 응답이 비어있습니다.");
+    }
+    return data.answer;
   };
 
   const handleSendMessage = async (e?: React.FormEvent) => {
@@ -369,10 +416,9 @@ export default function VideoAnalyzer() {
     setIsChatLoading(true);
 
     try {
-      // 챗봇은 아직 mock (AI 서버 연동 후 실제 API로 교체)
       const reply = MOCK_CHAT
         ? await mockChatReply(trimmed)
-        : await mockChatReply(trimmed);
+        : await realChatReply(trimmed);
       setMessages((prev) => [...prev, { role: "assistant", content: reply }]);
     } catch (err) {
       console.error(err);
@@ -380,7 +426,8 @@ export default function VideoAnalyzer() {
         ...prev,
         {
           role: "assistant",
-          content: "죄송합니다. 응답을 가져오는 중 오류가 발생했습니다.",
+          content:
+            "죄송합니다. 응답을 가져오는 중 오류가 발생했습니다. AI 서버 상태를 확인해주세요.",
           isError: true,
         },
       ]);
