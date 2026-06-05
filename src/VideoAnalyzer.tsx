@@ -33,7 +33,6 @@ type AnalysisResult = {
   duration: string;
   s3Key: string;
   resolution?: string;
-  frames?: number;
   points3D?: number;
   spatialConfidence?: number;
   spaceEstimate?: string;
@@ -55,7 +54,6 @@ type BackendResult = {
   status: string; // "DONE" | "FAILED"
   videoDurationSec?: number;
   videoResolution?: string;
-  frameCount?: number;
   points3D?: number;
   spatialConfidence?: number;
   estimatedType?: string;
@@ -98,6 +96,13 @@ export default function VideoAnalyzer() {
 
   // SSE 연결 참조 (정리용)
   const eventSourceRef = useRef<EventSource | null>(null);
+
+  // 영상 메타데이터 (프론트에서 직접 추출: 길이/해상도)
+  const [videoMeta, setVideoMeta] = useState<{
+    durationSec?: number;
+    width?: number;
+    height?: number;
+  }>({});
 
   const MAX_SIZE = 500 * 1024 * 1024; // 500MB
 
@@ -155,7 +160,22 @@ export default function VideoAnalyzer() {
       return;
     }
     setFile(selectedFile);
-    setPreview(URL.createObjectURL(selectedFile));
+    const objectUrl = URL.createObjectURL(selectedFile);
+    setPreview(objectUrl);
+
+    // 브라우저에서 영상 메타데이터 추출 (AI 서버가 못 주는 값: 길이/해상도)
+    const probe = document.createElement("video");
+    probe.preload = "metadata";
+    probe.onloadedmetadata = () => {
+      setVideoMeta({
+        durationSec: Math.round(probe.duration),
+        width: probe.videoWidth,
+        height: probe.videoHeight,
+      });
+    };
+    probe.onerror = () => setVideoMeta({});
+    probe.src = objectUrl;
+
     setStatus("idle");
     setErrorMsg("");
     setResult(null);
@@ -188,6 +208,7 @@ export default function VideoAnalyzer() {
     }
     setFile(null);
     setPreview(null);
+    setVideoMeta({});
     setStatus("idle");
     setUploadProgress(0);
     setResult(null);
@@ -203,13 +224,18 @@ export default function VideoAnalyzer() {
     s3Key: string
   ): AnalysisResult => {
     const objects = b.detectedObjects ?? [];
+    // 길이/해상도: 백엔드(AI)가 주면 그 값, 없으면 프론트에서 추출한 메타데이터 사용
+    const durationSec = b.videoDurationSec ?? videoMeta.durationSec;
+    const resolution =
+      b.videoResolution ??
+      (videoMeta.width && videoMeta.height
+        ? `${videoMeta.width}×${videoMeta.height}`
+        : undefined);
     return {
       videoId: b.jobId,
-      duration:
-        b.videoDurationSec !== undefined ? `${b.videoDurationSec}초` : "—",
+      duration: durationSec !== undefined ? `${durationSec}초` : "—",
       s3Key,
-      resolution: b.videoResolution,
-      frames: b.frameCount,
+      resolution,
       points3D: b.points3D,
       spatialConfidence: b.spatialConfidence,
       spaceEstimate: b.estimatedType,
@@ -668,24 +694,8 @@ export default function VideoAnalyzer() {
                     <span className="font-mono">{ph(result.duration)}</span>
                   </div>
                   <div className="flex justify-between">
-                    <span className="text-zinc-500">추출 프레임</span>
-                    <span className="font-mono">{ph(result.frames)}</span>
-                  </div>
-                  <div className="flex justify-between">
-                    <span className="text-zinc-500">3D 포인트 수</span>
-                    <span className="font-mono">
-                      {result.points3D
-                        ? result.points3D.toLocaleString()
-                        : "—"}
-                    </span>
-                  </div>
-                  <div className="flex justify-between">
-                    <span className="text-zinc-500">공간 추론 신뢰도</span>
-                    <span className="font-mono text-emerald-400">
-                      {result.spatialConfidence !== undefined
-                        ? `${(result.spatialConfidence * 100).toFixed(0)}%`
-                        : "—"}
-                    </span>
+                    <span className="text-zinc-500">해상도</span>
+                    <span className="font-mono">{ph(result.resolution)}</span>
                   </div>
 
                   <div className="pt-2 border-t border-zinc-800">
